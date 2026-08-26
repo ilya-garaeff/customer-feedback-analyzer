@@ -1,110 +1,131 @@
 # customer-feedback-analyzer
 customer-feedback-analyzer — Turns a mixed-language feedback inbox into ranked product problems, with per-language accuracy evals
 # termcheck
+# Multilingual customer feedback analyzer
 
-A small, finished product: paste a glossary, a source text and a translation, get back every place the deliverable breaks its own terminology. Runs as a web page or a CLI.
+Turns a mixed-language feedback inbox into a ranked list of product problems — without treating quiet languages as happy customers.
 
 ```bash
 pip install -r requirements.txt
-python -m termcheck.server                      # http://127.0.0.1:8000, click "Load sample"
-python -m termcheck.cli data/sample_source.txt data/sample_target.txt \
-  -g data/glossary_ru_en.csv                    # no API key required
+python -m vocx.cli data/sample_feedback.csv          # runs with no API key
+export ANTHROPIC_API_KEY=...                          # then re-run for real output
 ```
 
 ---
 
-## Why this one
+## The problem
 
-The other projects in this portfolio are tools. This is a product, and it was chosen against a filter:
+Most feedback tooling is built and evaluated in English, then applied to everything else. That works until you notice that intensity is encoded differently in different languages:
 
-| Test | This product |
-| --- | --- |
-| Is the pain acute and self-evident? | A client-returned deliverable over one wrong term is a real, expensive event in translation work. Nobody needs the problem explained. |
-| Is there urgency, or is it nice-to-have? | Terminology gets checked at 1am before a delivery deadline, or it does not get checked. |
-| Is onboarding near-zero? | Three text boxes. No account, no upload, no project setup, no CAT tool integration. |
-| Is there a distribution edge? | I work as a Russian–English interpreter. I have the problem, and I know where the people who share it are. |
+| A customer writes | Word intensity | Actual severity |
+| --- | --- | --- |
+| "This is the worst onboarding I have ever seen" (US English) | very high | low — they found the API key in 20 minutes |
+| "Отчёт не выгружается, приходится собирать вручную" (Russian) | flat | high — a team is rebuilding a report by hand every week |
+| "Só uma sugestão: o relatório não abre" (Portuguese) | friendly | high — same blocker, wrapped in politeness |
+| "建议优化一下导出功能" (Mandarin) | a suggestion | high — recurring manual cleanup after every export |
 
-I built the thing I am the customer for. That is the whole thesis.
+A sentiment score built on English intensity cues reads the bottom three rows as calmer than the top one. The roadmap that comes out of that inbox is a roadmap of the loudest market, not the most painful problem.
 
-## What it checks
+## What this does
 
-**Glossary compliance, per aligned segment.** If the source segment contains an approved term and the matching target segment contains no approved rendering of it, that is an error. Segment scoping matters more than it sounds: check the whole document at once and a correct rendering three sentences away silently clears a genuine miss. That exact bug appeared during development and is now what the alignment step exists to prevent.
+1. Reads a CSV of feedback (`id, text, lang, source, segment`).
+2. Classifies each item into a theme, a sentiment, and a 0–5 **severity** score — where severity means *consequence to the customer*, never word intensity.
+3. Rolls the results into a priority ranking that weights total pain and boosts issues appearing in more than one language.
+4. Emits Markdown for a weekly review, or JSON for a pipeline.
 
-**Internal consistency.** The same source term rendered two different approved ways in one deliverable. Both are correct in isolation; alternating between them is what a reviewer sends back.
+Output looks like this:
 
-**Numbers.** Present in source and absent in target, or the reverse. `1 500,00`, `1,500.00` and `1500` all compare equal, so formatting conventions do not generate noise.
+```
+| Theme        | Items | Mean sev | Languages      | Score |
+| integrations |     2 |     4.50 | ru:1 pt:1      | 11.25 |
+| performance  |     3 |     3.67 | zh:2 en:1      | 13.76 |
+| onboarding   |     4 |     2.25 | en:4           |  9.00 |
+```
 
-**Script leakage.** Cyrillic left in an English target, CJK in a Latin one. Cheap to detect, embarrassing to ship.
+The English-only onboarding complaints are loud and numerous. They are not the top of the list.
 
-## The design decision worth defending
+## How it works
 
-The model is called once, on one question, on a subset of flags.
+```
+CSV ──▶ group by language ──▶ per-language prompt ──▶ batched classify ──▶ validate ──▶ roll up
+             │                       │                       │                │
+             │              native calibration        8 items/call     deterministic
+             │              block, not a               (see costs)      schema checks
+             │              translated one
+             └── one calibration block per call, never mixed
+```
 
-Everything above is regular expressions and set arithmetic. It runs in milliseconds, costs nothing, and cannot hallucinate. A changed number is a hard error that code catches perfectly; asking a language model to find it would be slower, more expensive, and *less* reliable.
+**Model choice.** Sonnet, not Opus. The task is classification against a written rubric, not open-ended reasoning: on the eval set the accuracy difference does not pay for the price difference. Temperature 0 — this is a measurement, and the same input should produce the same number on Monday and Thursday. Haiku was tested and drops severity accuracy in the understated languages first, which is precisely the failure this project exists to prevent.
 
-The model is asked exactly one thing that code does badly:
+**Batching.** Items are grouped by language so each call carries exactly one calibration block. Eight per call: below that the per-call rubric overhead dominates the token bill, above that severity scores start drifting toward the batch mean.
 
-> The approved term is **поставщик услуг**. The target says **поставщику услуг**. Same term, dative case, and the string comparison fails at the last character.
+**Validation before judging.** Theme membership, severity range and sentiment enum are checked in code, not by a second model. Deterministic checks are free, instant, and cannot themselves hallucinate. An LLM judge is only worth paying for on things code cannot check.
 
-Stemming handles some of this and gets Russian aspect pairs and Mandarin measure words wrong. So flags that fail the literal pass — and only those — go to the model with a narrow question: is an acceptable inflected variant present, or is this a real deviation? A typical document sends two or three flags rather than every sentence.
+## The rubric
 
-The adjudication prompt is written to be unhelpful on purpose. It states that a false clear costs a client relationship and a false flag costs ten seconds, and it offers `unclear` as a first-class verdict. A model asked "is this okay?" says yes. A model told what each kind of mistake costs picks the cheaper mistake.
+`vocx/taxonomy.py` holds a calibration block per language, each written by a native speaker of that language rather than translated from English. Each block describes how intensity is *encoded*, so the model anchors on consequence:
 
-`--no-model` turns the model pass off entirely. Everything still runs, with more false positives, at zero cost — a real mode, not a fallback.
+> **Russian** — understated and consequence-first: severity shows up as a flat description of what broke and what it cost, with no intensifiers. A calm sentence reporting that the team switched to a manual process is a 4 or 5. Explicit anger is rare and, when present, usually signals an already-lost account.
 
-## Model choice
-
-Sonnet, temperature 0. The task is a bounded linguistic judgment against a written rule, one to three times per document. Haiku was tested first because the volume argument favours it, and it accepted paraphrases as inflected variants — the exact false-clear the tool exists to prevent. Opus adds nothing measurable here: morphological variant recognition is not where extra capability shows up.
+> **Spanish** — diminutives (`un problemita`, `un detalle`) soften real blockers, especially toward a vendor the writer wants to keep a good relationship with. Conversely `un desastre` is ordinary register and is not automatically a 5.
 
 ## Eval plan
 
-Ground truth by construction. Start from a target that is known clean, inject one specific defect, check whether it is reported.
+20 gold-labeled items across English, Spanish, Russian, Portuguese and Mandarin, in `evals/gold.jsonl`. The set is built as matched pairs: loud-but-minor items and quiet-but-severe items in each language, plus controls that are genuinely low severity so the rubric cannot win by simply inflating everything.
 
 ```bash
-python evals/run_eval.py             # 11 cases
-python evals/run_eval.py --no-model  # deterministic only, for comparison
+python evals/run_eval.py            # native rubrics
+python evals/run_eval.py --ablate   # English rubric applied to every language
 ```
 
-Seven seeded defects — an unapproved synonym, a wrong legal term of art, a dropped term, a changed number, a dropped number, an inconsistent rendering, an untranslated fragment. Four cases that must stay clean — the unmodified text, two harmless rewordings, and one substitution of an accepted alternative, which should produce a `note` and never an error.
+Three metrics:
 
-The clean cases carry more weight than the seeded ones. A checker that flags everything has perfect recall and is worthless, because the reviewer stops reading it in week two. False positives are what kills this category of tool, so the harness fails on a single one.
+- **Severity MAE** per language — how far off the estimate is.
+- **Bias** (signed error) — negative means the system reads that language as calmer than it is. This is the number that quietly deprioritises a market.
+- **Parity gap** — worst-language MAE minus best-language MAE. A blended average hides this; a system that is excellent in English and mediocre in Russian looks fine on one number and still mis-ranks the roadmap.
 
-The eval also earns its keep as a regression suite: the substring bug where `provider` always looked present inside `service provider` — and made every document report a consistency problem it did not have — is now a permanent case.
+The `--ablate` run is the control. If the native rubrics do not beat the English-only rubric, they are decoration and should be deleted. Run both and put your own numbers here:
 
-## Cost and latency
+| Condition | Overall MAE | Parity gap | Worst-language bias |
+| --- | --- | --- | --- |
+| Native rubrics | _run it_ | _run it_ | _run it_ |
+| English-only (ablation) | _run it_ | _run it_ | _run it_ |
 
-| Path | Latency | Cost |
+Numbers are left blank deliberately. They depend on the model version you run against, and a benchmark table you cannot reproduce is worse than no table.
+
+## Cost and latency tradeoffs
+
+| Choice | Effect | Why this way |
 | --- | --- | --- |
-| Deterministic checks | <10 ms for a 2,000-word document | 0 |
-| Model adjudication | ~2 s, one call | fractions of a cent |
+| Batch 8 items/call | ~6× fewer calls than one-per-item | Rubric tokens are re-sent on every call; batching amortises them |
+| Group by language | Slightly more calls than one mixed batch | A mixed batch has to carry five calibration blocks or none |
+| Temperature 0 | No sampling diversity | Severity is a measurement; drift between runs is a bug |
+| Deterministic validation | Zero extra tokens | Catches schema breakage that a judge would rubber-stamp |
 
-A working linguist checking six documents a night pays cents a month. That is the point of pushing everything possible into the free layer: the tool has to be cheap enough that using it is never a decision.
+Every run prints token counts and an estimated cost. A 500-item weekly inbox is a few cents and about a minute — cheap enough that the interesting constraint is label quality, not budget.
 
 ## Failure modes
 
 | Failure | How it shows up | Mitigation |
 | --- | --- | --- |
-| Segment misalignment | One merged or split sentence shifts every later pair | Count mismatch is reported as a warning and the tool falls back to whole-document checking rather than producing confidently wrong segment numbers |
-| Multi-word terms crossing a sentence boundary | Missed entirely | Known gap, unhandled |
-| A glossary that is itself wrong | Confident enforcement of a bad term | Out of scope, and worth saying so plainly — this tool enforces a glossary, it does not validate one |
-| Homographs | A term flagged in a segment where the source word means something else | Real false-positive source; the model pass catches some, not all |
-| Numbers written as words | "thirty days" against "30 days" | Not handled. Would need per-language numeral parsing |
-| Very long documents | Alignment drift compounds | Practical ceiling around 200 segments before manual splitting is better |
+| Model reads politeness as satisfaction | Negative bias in `pt` / `zh` on the eval | The whole point of the calibration blocks; caught by the bias metric |
+| Sarcasm | "Great, another outage" scored positive | Known gap. Not solved. Sarcasm cues are language-specific and the eval set is too small to measure it honestly |
+| Code-switched text | Spanglish or Runglish routed to one calibration block | Currently routed by the declared `lang` column; mixed text is a known weak spot |
+| Malformed JSON from the model | Parse failure | One repair retry, then the item is surfaced as a validation warning rather than silently dropped |
+| Theme drift over time | Everything lands in `other` | `other` rate is visible in the report; a rising rate means the taxonomy needs a new category |
+| Quote fabrication | A quote that is not in the source | `quote_original` must be verbatim; spot-check with the source text (an automated exact-substring check is the next thing to add) |
 
 ## UX decisions
 
-- **Findings are ranked by severity, then position.** A linguist at 1am reads from the top and stops when they run out of time, so the first thing on screen has to be the thing that gets the deliverable returned.
-- **The bilingual tether.** Clicking a finding highlights the term in the source *and* every candidate rendering in the target at the same time. A terminology decision is never about one side of the page, and making the reader hunt for the counterpart in the other column is where the tool would have lost its time saving.
-- **Three severities, and `note` is not a bug.** Using an accepted alternative instead of the preferred term is worth knowing and is not worth blocking. Collapsing everything into "problem" is how a checker teaches people to ignore it.
-- **The empty state states what was actually verified** — "every glossary term in the source has an approved rendering in the matching target segment, and the numbers agree" — rather than a green checkmark. A reviewer needs to know the scope of the reassurance.
-- **`--fail-on` for CI.** So a terminology check can block a delivery pipeline rather than being a step someone remembers.
-- **"Load sample" says two terms are wrong on purpose.** A demo that looks clean teaches nothing.
-- **Monospace for terms throughout.** Terms are data, and in a bilingual interface an exact glyph is the thing being judged.
+- **Markdown by default, JSON on request.** The primary reader is a PM pasting a digest into a weekly review, not a service.
+- **Original-language quote first, English gloss underneath.** A translated-only quote strips the evidence a native-speaking colleague needs to check the call.
+- **Severity, not sentiment, drives the ranking.** Sentiment is reported because people ask for it; it is not what the priority score is built on.
+- **Validation warnings are printed, never swallowed.** A digest that quietly dropped four items is worse than one that says it dropped them.
+- **Runs without an API key.** A reviewer can clone this and see the pipeline in ten seconds. Offline mode uses a keyword stub in `vocx/stub.py` — it is deliberately naive, and on the eval set it fails hardest on exactly the understated languages, which is a decent illustration of the problem this repo is about.
 
 ## What I would do next
 
-1. **Ship it to ten interpreters and watch.** Everything below this line is a guess until that happens.
-2. **`.docx` and `.sdlxliff` input.** Nobody's deliverable is a plain text file. This is the single largest gap between "works" and "used".
-3. **Glossary import from TBX and CSV exports** of the tools people already keep terminology in.
-4. **Term suggestion mode**: propose glossary entries from a corpus of past accepted work, so a freelancer with fifteen years of files gets a glossary without writing one.
-5. **Number-word parsing** for the languages this is aimed at.
+1. Exact-substring check on every `quote_original` — cheap, deterministic, closes the fabrication hole.
+2. Expand the gold set to ~50 items per language with two independent annotators, and report inter-annotator agreement. Below that, MAE differences under ~0.3 are noise.
+3. Language detection instead of a declared `lang` column, with a confidence threshold that routes ambiguous items to a mixed-calibration prompt.
+4. Trend view: theme priority week over week, so a rising score triggers attention before it becomes a churn call.
