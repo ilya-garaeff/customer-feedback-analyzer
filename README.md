@@ -1,131 +1,70 @@
-# customer-feedback-analyzer
-customer-feedback-analyzer — Turns a mixed-language feedback inbox into ranked product problems, with per-language accuracy evals
-# termcheck
 # Multilingual customer feedback analyzer
 
-Turns a mixed-language feedback inbox into a ranked list of product problems — without treating quiet languages as happy customers.
+Classifies a mixed-language feedback CSV into themes with a 0–5 severity score, then ranks themes by total severity rather than volume. Written to test one specific idea: that a severity rubric written natively per language scores understated languages more accurately than an English rubric applied to everything.
+
+## Run
 
 ```bash
 pip install -r requirements.txt
-python -m vocx.cli data/sample_feedback.csv          # runs with no API key
-export ANTHROPIC_API_KEY=...                          # then re-run for real output
+
+make serve    # http://127.0.0.1:8000, click "Load sample"
+make demo     # CLI, no API key needed
+make verify   # 13 assertions
+make eval     # scores the classifier against evals/gold.jsonl
+make ablate   # same eval with the English rubric forced onto every language
+
+export ANTHROPIC_API_KEY=...   # then re-run for real model output
 ```
 
----
+## What the code does
 
-## The problem
+`vocx/taxonomy.py` holds a 13-theme list, an anchored 0–5 severity scale, and a calibration paragraph per language (en, es, ru, pt, zh). Severity is defined as consequence to the customer, not word intensity.
 
-Most feedback tooling is built and evaluated in English, then applied to everything else. That works until you notice that intensity is encoded differently in different languages:
+`vocx/analyze.py` groups items by language so each API call carries exactly one calibration block, batches 8 per call, and parses the response into `Verdict` objects. `Verdict.validate()` checks theme membership, severity range and sentiment enum in code — no judge model. `report()` ranks themes by `count × mean_severity`, with a 1.25× multiplier for themes appearing in more than one language.
 
-| A customer writes | Word intensity | Actual severity |
+`vocx/cli.py` outputs Markdown or JSON and prints token usage and estimated cost.
+
+`vocx/stub.py` is a keyword classifier used when no API key is present, so the pipeline and the eval harness run on a fresh clone.
+
+## Interface
+
+`make serve` runs a FastAPI app with one endpoint. Paste a CSV, get the ranked theme list.
+
+Each theme draws two bars: how much is said about it, and what it costs. Where the second runs well past the first, a quiet theme is outranking a loud one, and the page says so in words rather than leaving you to read the pixels. That divergence is the only reason this tool ranks on severity instead of volume, so it is the thing the interface is built around.
+
+Clicking a theme swaps the side rail to that theme's examples, original language first with the English gloss underneath — a native-speaking colleague needs the original to check the call. Items that failed schema validation are listed rather than dropped.
+
+## Where things are
+
+| File | Lines | What it holds |
 | --- | --- | --- |
-| "This is the worst onboarding I have ever seen" (US English) | very high | low — they found the API key in 20 minutes |
-| "Отчёт не выгружается, приходится собирать вручную" (Russian) | flat | high — a team is rebuilding a report by hand every week |
-| "Só uma sugestão: o relatório não abre" (Portuguese) | friendly | high — same blocker, wrapped in politeness |
-| "建议优化一下导出功能" (Mandarin) | a suggestion | high — recurring manual cleanup after every export |
+| `vocx/taxonomy.py` | ~90 | Theme list, severity anchors, the five calibration blocks, prompt builder |
+| `vocx/analyze.py` | ~160 | Load, batch, classify, validate, roll up, render Markdown |
+| `vocx/cli.py` | ~40 | Argument parsing, output |
+| `vocx/server.py` | ~55 | FastAPI app, `POST /api/analyze` |
+| `vocx/web/index.html` | ~230 | Full UI including the divergence bars |
+| `vocx/llm.py` | ~130 | Anthropic wrapper, usage/cost accounting, offline replay |
+| `vocx/stub.py` | ~70 | Offline keyword classifier |
+| `evals/gold.jsonl` | 20 items | Gold theme + severity labels across five languages |
+| `evals/run_eval.py` | ~110 | Per-language MAE, signed bias, theme accuracy, parity gap, ablation switch |
+| `tests/smoke.py` | ~70 | 13 assertions across the pipeline, validation, ranking and the API |
 
-A sentiment score built on English intensity cues reads the bottom three rows as calmer than the top one. The roadmap that comes out of that inbox is a roadmap of the loudest market, not the most painful problem.
+## Evals
 
-## What this does
+`evals/gold.jsonl` has 20 hand-labeled items, four per language, built as matched pairs: loud-but-minor items and quiet-but-severe items in each language, plus genuinely low-severity controls so a rubric cannot win by inflating everything.
 
-1. Reads a CSV of feedback (`id, text, lang, source, segment`).
-2. Classifies each item into a theme, a sentiment, and a 0–5 **severity** score — where severity means *consequence to the customer*, never word intensity.
-3. Rolls the results into a priority ranking that weights total pain and boosts issues appearing in more than one language.
-4. Emits Markdown for a weekly review, or JSON for a pipeline.
+`run_eval.py` reports three numbers per language — severity MAE, signed bias (negative means the system reads that language as calmer than it is), and theme accuracy — plus the parity gap between the best and worst language.
 
-Output looks like this:
+`--ablate` overwrites every calibration block with the English one. That is the control condition. **I have not yet run either condition against a live model, so I have no results to report.** The harness works and the offline stub scores against it; the comparison that would justify the per-language rubrics is the next thing to run, not something already established.
 
-```
-| Theme        | Items | Mean sev | Languages      | Score |
-| integrations |     2 |     4.50 | ru:1 pt:1      | 11.25 |
-| performance  |     3 |     3.67 | zh:2 en:1      | 13.76 |
-| onboarding   |     4 |     2.25 | en:4           |  9.00 |
-```
+## Limits
 
-The English-only onboarding complaints are loud and numerous. They are not the top of the list.
+- 20 eval items is too few to distinguish MAE differences below roughly 0.3. Real conclusions need ~50 per language and a second annotator.
+- Language is read from a `lang` column, not detected. Code-switched text is routed to one calibration block and handled badly.
+- `quote_original` is not verified to be a verbatim substring of the input.
+- `BATCH_SIZE = 8` is a guess, not a tuned value.
+- Sarcasm is unhandled and unmeasured.
 
-## How it works
+## Model
 
-```
-CSV ──▶ group by language ──▶ per-language prompt ──▶ batched classify ──▶ validate ──▶ roll up
-             │                       │                       │                │
-             │              native calibration        8 items/call     deterministic
-             │              block, not a               (see costs)      schema checks
-             │              translated one
-             └── one calibration block per call, never mixed
-```
-
-**Model choice.** Sonnet, not Opus. The task is classification against a written rubric, not open-ended reasoning: on the eval set the accuracy difference does not pay for the price difference. Temperature 0 — this is a measurement, and the same input should produce the same number on Monday and Thursday. Haiku was tested and drops severity accuracy in the understated languages first, which is precisely the failure this project exists to prevent.
-
-**Batching.** Items are grouped by language so each call carries exactly one calibration block. Eight per call: below that the per-call rubric overhead dominates the token bill, above that severity scores start drifting toward the batch mean.
-
-**Validation before judging.** Theme membership, severity range and sentiment enum are checked in code, not by a second model. Deterministic checks are free, instant, and cannot themselves hallucinate. An LLM judge is only worth paying for on things code cannot check.
-
-## The rubric
-
-`vocx/taxonomy.py` holds a calibration block per language, each written by a native speaker of that language rather than translated from English. Each block describes how intensity is *encoded*, so the model anchors on consequence:
-
-> **Russian** — understated and consequence-first: severity shows up as a flat description of what broke and what it cost, with no intensifiers. A calm sentence reporting that the team switched to a manual process is a 4 or 5. Explicit anger is rare and, when present, usually signals an already-lost account.
-
-> **Spanish** — diminutives (`un problemita`, `un detalle`) soften real blockers, especially toward a vendor the writer wants to keep a good relationship with. Conversely `un desastre` is ordinary register and is not automatically a 5.
-
-## Eval plan
-
-20 gold-labeled items across English, Spanish, Russian, Portuguese and Mandarin, in `evals/gold.jsonl`. The set is built as matched pairs: loud-but-minor items and quiet-but-severe items in each language, plus controls that are genuinely low severity so the rubric cannot win by simply inflating everything.
-
-```bash
-python evals/run_eval.py            # native rubrics
-python evals/run_eval.py --ablate   # English rubric applied to every language
-```
-
-Three metrics:
-
-- **Severity MAE** per language — how far off the estimate is.
-- **Bias** (signed error) — negative means the system reads that language as calmer than it is. This is the number that quietly deprioritises a market.
-- **Parity gap** — worst-language MAE minus best-language MAE. A blended average hides this; a system that is excellent in English and mediocre in Russian looks fine on one number and still mis-ranks the roadmap.
-
-The `--ablate` run is the control. If the native rubrics do not beat the English-only rubric, they are decoration and should be deleted. Run both and put your own numbers here:
-
-| Condition | Overall MAE | Parity gap | Worst-language bias |
-| --- | --- | --- | --- |
-| Native rubrics | _run it_ | _run it_ | _run it_ |
-| English-only (ablation) | _run it_ | _run it_ | _run it_ |
-
-Numbers are left blank deliberately. They depend on the model version you run against, and a benchmark table you cannot reproduce is worse than no table.
-
-## Cost and latency tradeoffs
-
-| Choice | Effect | Why this way |
-| --- | --- | --- |
-| Batch 8 items/call | ~6× fewer calls than one-per-item | Rubric tokens are re-sent on every call; batching amortises them |
-| Group by language | Slightly more calls than one mixed batch | A mixed batch has to carry five calibration blocks or none |
-| Temperature 0 | No sampling diversity | Severity is a measurement; drift between runs is a bug |
-| Deterministic validation | Zero extra tokens | Catches schema breakage that a judge would rubber-stamp |
-
-Every run prints token counts and an estimated cost. A 500-item weekly inbox is a few cents and about a minute — cheap enough that the interesting constraint is label quality, not budget.
-
-## Failure modes
-
-| Failure | How it shows up | Mitigation |
-| --- | --- | --- |
-| Model reads politeness as satisfaction | Negative bias in `pt` / `zh` on the eval | The whole point of the calibration blocks; caught by the bias metric |
-| Sarcasm | "Great, another outage" scored positive | Known gap. Not solved. Sarcasm cues are language-specific and the eval set is too small to measure it honestly |
-| Code-switched text | Spanglish or Runglish routed to one calibration block | Currently routed by the declared `lang` column; mixed text is a known weak spot |
-| Malformed JSON from the model | Parse failure | One repair retry, then the item is surfaced as a validation warning rather than silently dropped |
-| Theme drift over time | Everything lands in `other` | `other` rate is visible in the report; a rising rate means the taxonomy needs a new category |
-| Quote fabrication | A quote that is not in the source | `quote_original` must be verbatim; spot-check with the source text (an automated exact-substring check is the next thing to add) |
-
-## UX decisions
-
-- **Markdown by default, JSON on request.** The primary reader is a PM pasting a digest into a weekly review, not a service.
-- **Original-language quote first, English gloss underneath.** A translated-only quote strips the evidence a native-speaking colleague needs to check the call.
-- **Severity, not sentiment, drives the ranking.** Sentiment is reported because people ask for it; it is not what the priority score is built on.
-- **Validation warnings are printed, never swallowed.** A digest that quietly dropped four items is worse than one that says it dropped them.
-- **Runs without an API key.** A reviewer can clone this and see the pipeline in ten seconds. Offline mode uses a keyword stub in `vocx/stub.py` — it is deliberately naive, and on the eval set it fails hardest on exactly the understated languages, which is a decent illustration of the problem this repo is about.
-
-## What I would do next
-
-1. Exact-substring check on every `quote_original` — cheap, deterministic, closes the fabrication hole.
-2. Expand the gold set to ~50 items per language with two independent annotators, and report inter-annotator agreement. Below that, MAE differences under ~0.3 are noise.
-3. Language detection instead of a declared `lang` column, with a confidence threshold that routes ambiguous items to a mixed-calibration prompt.
-4. Trend view: theme priority week over week, so a rising score triggers attention before it becomes a churn call.
+Sonnet at temperature 0, configurable via `--model` and the `MODEL` env var. Temperature 0 because severity is meant to be a repeatable measurement. Cost estimates in `Usage` use public list prices and can be overridden with `PRICE_IN` / `PRICE_OUT`.
